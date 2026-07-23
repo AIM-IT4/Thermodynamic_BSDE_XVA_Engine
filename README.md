@@ -7,6 +7,16 @@ Deep-BSDE experiment, and a static option-surface repair.
 It is not production software and must not be used for trading, regulatory
 capital, accounting, credit approval, or counterparty-risk decisions.
 
+## Generated diagnostics
+
+The tracked charts below are produced by run_simulation.py from simulated
+paths and static call-price repair. They are illustrative teaching outputs,
+not calibration, validation, or a no-arbitrage certificate.
+
+![Pathwise XVA diagnostics](xva_thermodynamic_diagnostics.png)
+
+![Data-backed XVA surfaces](xva_3d_surfaces.png)
+
 ## What is implemented
 
 - Reproducible risk-neutral log-spot, full-truncation variance, and short-rate
