@@ -1,50 +1,221 @@
-"""
-Unit Test Suite for Thermodynamic BSDE XVA Engine.
-Verifies stochastic process bounds, martingale properties, and XVA metrics.
-"""
+"""Regression and benchmark tests for the educational XVA lab."""
+
+from __future__ import annotations
 
 import unittest
-import numpy as np
 
-from config import SimulationConfig, MarketConfig, CreditConfig
+import numpy as np
+import torch
+
+from config import BSDENetworkConfig, CreditConfig, MarketConfig, SimulationConfig
 from models.stochastic_processes import MultiFactorStochasticEngine
-from solvers.thermodynamic_arbitrage import ThermodynamicArbitrageEngine
+from solvers.deep_bsde_solver import DeepBSDESolver, LeastSquaresMonteCarloPricer
+from solvers.thermodynamic_arbitrage import MarketDiagnostics, StaticArbitrageSurfaceRepair
 from xva.engine import ComprehensiveXVAEngine
 
-class TestThermodynamicXVAEngine(unittest.TestCase):
 
-    def setUp(self):
-        self.sim_cfg = SimulationConfig(n_paths=1000, n_steps=50, horizon=0.5, seed=123)
-        self.mkt_cfg = MarketConfig()
-        self.credit_cfg = CreditConfig()
-        self.stoch_engine = MultiFactorStochasticEngine(self.sim_cfg, self.mkt_cfg, self.credit_cfg)
-        self.paths = self.stoch_engine.generate_paths(s0=100.0)
+class TestEducationalXVALab(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sim = SimulationConfig(n_paths=256, n_steps=8, horizon=0.5, seed=123)
+        self.market = MarketConfig()
+        self.credit = CreditConfig(
+            threshold=5.0,
+            minimum_transfer_amount=0.0,
+            margin_period_of_risk=1.0 / 252.0,
+        )
+        self.paths = MultiFactorStochasticEngine(
+            self.sim,
+            self.market,
+            self.credit,
+        ).generate_paths(s0=100.0)
 
-    def test_stochastic_path_shapes(self):
-        """Verify output matrices have correct shape (n_paths, n_steps + 1)"""
-        S = self.paths["S"]
-        self.assertEqual(S.shape, (1000, 51))
-        self.assertTrue(np.all(S > 0), "Asset price S_t must be strictly positive.")
+    @staticmethod
+    def _profiles(
+        positive: np.ndarray,
+        negative: np.ndarray | None = None,
+        mpor_positive: np.ndarray | None = None,
+        mpor_negative: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray | float]:
+        if negative is None:
+            negative = np.zeros_like(positive)
+        if mpor_positive is None:
+            mpor_positive = positive
+        if mpor_negative is None:
+            mpor_negative = negative
+        return {
+            "EE": np.mean(positive, axis=0),
+            "NEE": np.mean(negative, axis=0),
+            "PFE_95": np.quantile(positive, 0.95, axis=0),
+            "PFE_99": np.quantile(positive, 0.99, axis=0),
+            "EPE": 0.0,
+            "pos_exposure_matrix": positive,
+            "neg_exposure_matrix": negative,
+            "mpor_pos_exposure_matrix": mpor_positive,
+            "mpor_neg_exposure_matrix": mpor_negative,
+        }
 
-    def test_variance_positivity(self):
-        """Verify Heston variance paths remain non-negative under full truncation"""
-        V = self.paths["V"]
-        self.assertTrue(np.all(V >= 0), "Heston variance V_t must be non-negative.")
+    def test_paths_are_reproducible_positive_and_discounted_from_one(self) -> None:
+        repeat = MultiFactorStochasticEngine(
+            self.sim,
+            self.market,
+            self.credit,
+        ).generate_paths(s0=100.0)
 
-    def test_entropy_production_positivity(self):
-        """Verify thermodynamic entropy production rate is non-negative (No-Arbitrage)"""
-        entropy = ThermodynamicArbitrageEngine.compute_entropy_production(self.paths["S"], self.paths["r"], self.stoch_engine.dt)
-        self.assertTrue(np.all(entropy >= 0.0), "Entropy production rate must be non-negative under no-arbitrage.")
+        self.assertEqual(self.paths["S"].shape, (256, 9))
+        self.assertEqual(self.paths["dW"].shape, (256, 8, 3))
+        self.assertTrue(np.all(self.paths["S"] > 0.0))
+        self.assertTrue(np.allclose(self.paths["discount_factors"][:, 0], 1.0))
+        self.assertTrue(np.allclose(self.paths["S"], repeat["S"]))
+        self.assertTrue(np.allclose(self.paths["dW"], repeat["dW"]))
 
-    def test_xva_metrics_non_negative(self):
-        """Verify CVA and FVA metrics are non-negative for uncollateralized positive exposure"""
-        portfolio_mtm = np.maximum(0.0, self.paths["S"] - 100.0)
-        xva_engine = ComprehensiveXVAEngine(self.sim_cfg, self.credit_cfg)
-        profiles = xva_engine.compute_exposure_profiles(portfolio_mtm)
-        xva_res = xva_engine.calculate_xva_metrics(profiles, self.paths["discount_factors"])
-        
-        self.assertGreaterEqual(xva_res["CVA"], 0.0, "CVA must be non-negative.")
-        self.assertGreaterEqual(xva_res["FVA"], 0.0, "FVA must be non-negative.")
+    def test_log_spot_scheme_remains_positive_under_stress(self) -> None:
+        stressed_paths = MultiFactorStochasticEngine(
+            SimulationConfig(n_paths=10_000, n_steps=1, horizon=1.0, seed=11),
+            MarketConfig(v0=4.0, theta_v=4.0, sigma_v=0.0),
+            CreditConfig(),
+        ).generate_paths()
+        self.assertTrue(np.all(stressed_paths["S"] > 0.0))
 
-if __name__ == '__main__':
+    def test_collateral_call_frequency_mta_and_mpor(self) -> None:
+        sim = SimulationConfig(n_paths=2, n_steps=4, horizon=4.0 / 252.0, seed=1)
+        credit = CreditConfig(
+            threshold=10.0,
+            minimum_transfer_amount=5.0,
+            collateral_call_frequency_days=2,
+            margin_period_of_risk=2.0 / 252.0,
+        )
+        engine = ComprehensiveXVAEngine(sim, credit)
+        mtm = np.array(
+            [
+                [0.0, 20.0, 12.0, 30.0, 25.0],
+                [0.0, -20.0, -12.0, -30.0, -25.0],
+            ]
+        )
+        collateral = engine.compute_collateral_margin(mtm)
+        profiles = engine.compute_exposure_profiles(mtm, collateral)
+
+        self.assertTrue(np.allclose(collateral[:, :4], 0.0))
+        self.assertTrue(np.allclose(collateral[:, 4], [15.0, -15.0]))
+        self.assertAlmostEqual(profiles["mpor_pos_exposure_matrix"][0, 0], 12.0)
+        self.assertAlmostEqual(profiles["mpor_neg_exposure_matrix"][1, 0], 12.0)
+
+    def test_one_period_cva_matches_first_to_default_benchmark(self) -> None:
+        sim = SimulationConfig(n_paths=1, n_steps=1, horizon=1.0, seed=1)
+        credit = CreditConfig(
+            hazard_rate_c=0.03,
+            hazard_rate_i=0.0,
+            lgd_c=0.60,
+            funding_spread=0.0,
+            im_funding_spread=0.0,
+            cost_of_capital=0.0,
+        )
+        engine = ComprehensiveXVAEngine(sim, credit)
+        positive = np.ones((1, 2))
+        results = engine.calculate_xva_metrics(
+            self._profiles(positive),
+            np.ones((1, 2)),
+        )
+        expected_cva = credit.lgd_c * (1.0 - np.exp(-credit.hazard_rate_c))
+        self.assertAlmostEqual(results["CVA"], expected_cva, places=12)
+
+    def test_pathwise_wwr_is_preserved(self) -> None:
+        sim = SimulationConfig(n_paths=2, n_steps=1, horizon=1.0, seed=1)
+        credit = CreditConfig(
+            hazard_rate_c=0.0,
+            hazard_rate_i=0.0,
+            funding_spread=0.0,
+            im_funding_spread=0.0,
+            cost_of_capital=0.0,
+        )
+        engine = ComprehensiveXVAEngine(sim, credit)
+        positive = np.array([[10.0, 10.0], [0.0, 0.0]])
+        profiles = self._profiles(positive)
+        aligned_hazard = np.array([[0.50, 0.50], [0.01, 0.01]])
+        anti_aligned_hazard = np.array([[0.01, 0.01], [0.50, 0.50]])
+
+        aligned = engine.calculate_xva_metrics(profiles, np.ones((2, 2)), aligned_hazard)
+        anti_aligned = engine.calculate_xva_metrics(profiles, np.ones((2, 2)), anti_aligned_hazard)
+        self.assertGreater(aligned["CVA"], anti_aligned["CVA"])
+
+    def test_lsmc_returns_clean_terminal_mtm(self) -> None:
+        payoff = lambda spot: np.maximum(spot - 100.0, 0.0)
+        values = LeastSquaresMonteCarloPricer(self.sim).solve(
+            self.paths["S"],
+            self.paths["discount_factors"],
+            payoff,
+        )
+        self.assertTrue(np.allclose(values[:, -1], payoff(self.paths["S"][:, -1])))
+        self.assertTrue(np.all(np.isfinite(values)))
+
+    def test_market_diagnostic_is_finite_and_descriptive(self) -> None:
+        diagnostic = MarketDiagnostics.compute_excess_return_dispersion(
+            self.paths["S"],
+            self.paths["r"],
+            self.sim.horizon / self.sim.n_steps,
+        )
+        self.assertEqual(diagnostic.shape, (self.sim.n_steps,))
+        self.assertTrue(np.all(np.isfinite(diagnostic)))
+        self.assertTrue(np.all(diagnostic >= 0.0))
+
+    def test_static_surface_repair_enforces_constraints_and_uses_strikes(self) -> None:
+        expiries = np.array([0.5, 1.0])
+        raw_iv = np.array([[0.60, 0.05, 0.60], [0.05, 0.70, 0.05]])
+        repair = StaticArbitrageSurfaceRepair(spot=100.0, rate=0.02)
+
+        result = repair.repair(np.array([80.0, 100.0, 120.0]), expiries, raw_iv)
+        diagnostics = result.diagnostics
+        self.assertGreaterEqual(diagnostics["min_monotonicity_slack"], -1e-7)
+        self.assertGreaterEqual(diagnostics["min_convexity_slack"], -1e-7)
+        self.assertGreaterEqual(diagnostics["min_calendar_slack"], -1e-7)
+        self.assertGreaterEqual(diagnostics["min_vertical_spread_upper_slack"], -1e-7)
+        vertical_spread = (
+            result.repaired_call_prices[:, :-1] - result.repaired_call_prices[:, 1:]
+        )
+        vertical_upper = np.exp(-0.02 * expiries)[:, np.newaxis] * 20.0
+        self.assertTrue(np.all(vertical_spread <= vertical_upper + 1e-7))
+
+        shifted = repair.repair(np.array([70.0, 100.0, 140.0]), expiries, raw_iv)
+        self.assertFalse(np.allclose(result.repaired_call_prices, shifted.repaired_call_prices))
+
+    def test_deep_bsde_driver_uses_credit_configuration(self) -> None:
+        sim = SimulationConfig(n_paths=4, n_steps=1, horizon=1.0, seed=2)
+        low_credit = DeepBSDESolver(
+            sim,
+            CreditConfig(hazard_rate_c=0.0, funding_spread=0.0),
+            BSDENetworkConfig(epochs=1, batch_size=4, hidden_dim=4),
+        )
+        high_credit = DeepBSDESolver(
+            sim,
+            CreditConfig(hazard_rate_c=0.50, funding_spread=0.50),
+            BSDENetworkConfig(epochs=1, batch_size=4, hidden_dim=4),
+        )
+        value = torch.tensor([1.0])
+        rate = torch.tensor([0.0])
+        hazard = torch.tensor([0.50])
+        collateral = torch.tensor([0.0])
+        self.assertLess(
+            high_credit.driver(value, rate, hazard, collateral).item(),
+            low_credit.driver(value, rate, hazard, collateral).item(),
+        )
+
+    def test_small_deep_bsde_run_consumes_simulated_brownian_increments(self) -> None:
+        sim = SimulationConfig(n_paths=32, n_steps=1, horizon=0.25, seed=4)
+        paths = MultiFactorStochasticEngine(sim, MarketConfig(), CreditConfig()).generate_paths()
+        solver = DeepBSDESolver(
+            sim,
+            CreditConfig(),
+            BSDENetworkConfig(hidden_dim=4, n_layers=1, epochs=2, batch_size=32),
+        )
+        result = solver.solve(
+            paths["factors"],
+            paths["dW"],
+            lambda factors: np.maximum(np.exp(factors[:, 0]) - 100.0, 0.0),
+            paths["r"],
+            paths["hazard"],
+        )
+        self.assertTrue(np.isfinite(result["Y0"]))
+        self.assertTrue(np.isfinite(result["loss"]))
+
+
+if __name__ == "__main__":
     unittest.main()

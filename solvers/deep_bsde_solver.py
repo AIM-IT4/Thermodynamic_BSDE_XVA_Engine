@@ -1,137 +1,258 @@
+"""Clean-price LSMC and an optional educational Deep-BSDE solver.
+
+The Deep-BSDE experiment consumes the Brownian increments actually used by the
+forward simulation. It is deliberately small and transparent; it is not a
+production XVA solver or an independent model-validation result.
 """
-Nonlinear Backward Stochastic Differential Equation (BSDE) Solvers for XVA Valuation.
-Implements PyTorch Deep BSDE Neural Network and Least-Squares Monte Carlo (LSMC) solvers.
-"""
+
+from __future__ import annotations
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from config import SimulationConfig, CreditConfig, BSDENetworkConfig
+
+from config import BSDENetworkConfig, CreditConfig, SimulationConfig
+
 
 class SubNetwork(nn.Module):
-    """Deep Neural Network approximating gradient Z_t = grad_x Y(t, X_t) at time step t"""
-    def __init__(self, dim: int, hidden_dim: int):
-        super(SubNetwork, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, dim)
-        )
+    """Approximate the Brownian integrand Z from the current factor state."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def __init__(
+        self,
+        state_dim: int,
+        brownian_dim: int,
+        hidden_dim: int,
+        n_layers: int,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = state_dim
+        for _ in range(max(1, n_layers)):
+            layers.extend([nn.Linear(in_dim, hidden_dim), nn.SiLU()])
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, brownian_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.net(state)
+
 
 class DeepBSDESolver:
-    """
-    High-Dimensional Deep BSDE Neural Network Solver.
-    Solves nonlinear XVA coupled FBSDEs where funding and credit spreads depend nonlinearly on portfolio value.
-    """
-    def __init__(self, sim_config: SimulationConfig, credit_config: CreditConfig, net_config: BSDENetworkConfig):
+    """Train a small neural BSDE experiment using genuine Brownian increments."""
+
+    def __init__(
+        self,
+        sim_config: SimulationConfig,
+        credit_config: CreditConfig,
+        net_config: BSDENetworkConfig,
+    ) -> None:
         self.sim = sim_config
         self.credit = credit_config
         self.net_cfg = net_config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def solve(self, X_paths: np.ndarray, payoff_fn) -> dict:
+    def driver(
+        self,
+        value: torch.Tensor,
+        short_rate: torch.Tensor,
+        counterparty_hazard: torch.Tensor,
+        collateral: torch.Tensor,
+    ) -> torch.Tensor:
+        """Simplified nonlinear XVA driver used only by this experiment.
+
+        The sign convention is -dY = f dt - Z dW. Positive unsecured value
+        attracts credit and funding cost; negative unsecured value receives an
+        issuer-default benefit. All coefficients come from CreditConfig.
         """
-        Solves the BSDE for terminal payoff g(X_T).
-        X_paths: shape (n_paths, n_steps + 1, dim)
-        """
-        n_paths, n_steps_p1, dim = X_paths.shape
-        n_steps = n_steps_p1 - 1
+        unsecured = value - collateral
+        positive = torch.relu(unsecured)
+        negative = torch.relu(-unsecured)
+        return (
+            -short_rate * value
+            - counterparty_hazard * self.credit.lgd_c * positive
+            - self.credit.funding_spread * positive
+            + self.credit.hazard_rate_i * self.credit.lgd_i * negative
+        )
+
+    @staticmethod
+    def _validate_paths(
+        factor_paths: np.ndarray,
+        brownian_increments: np.ndarray,
+        rate_paths: np.ndarray,
+        hazard_paths: np.ndarray,
+        collateral: np.ndarray | None,
+    ) -> tuple[int, int, int, int]:
+        if factor_paths.ndim != 3:
+            raise ValueError("factor_paths must have shape (n_paths, n_steps + 1, state_dim)")
+        n_paths, n_times, state_dim = factor_paths.shape
+        n_steps = n_times - 1
+        if n_steps <= 0 or state_dim <= 0:
+            raise ValueError("factor_paths must contain at least one step and one state")
+        if brownian_increments.ndim != 3 or brownian_increments.shape[:2] != (n_paths, n_steps):
+            raise ValueError("brownian_increments must have shape (n_paths, n_steps, brownian_dim)")
+        if brownian_increments.shape[2] <= 0:
+            raise ValueError("brownian_increments must contain at least one Brownian factor")
+        expected_time_shape = (n_paths, n_times)
+        for name, matrix in (("rate_paths", rate_paths), ("hazard_paths", hazard_paths)):
+            if matrix.shape != expected_time_shape:
+                raise ValueError(f"{name} must have shape {expected_time_shape}")
+        if collateral is not None and collateral.shape != expected_time_shape:
+            raise ValueError(f"collateral must have shape {expected_time_shape}")
+        return n_paths, n_steps, state_dim, brownian_increments.shape[2]
+
+    def solve(
+        self,
+        factor_paths: np.ndarray,
+        brownian_increments: np.ndarray,
+        payoff_fn,
+        rate_paths: np.ndarray,
+        hazard_paths: np.ndarray,
+        collateral: np.ndarray | None = None,
+    ) -> dict[str, float | str]:
+        """Fit Y0 and Z networks to a terminal payoff over simulated paths."""
+        factor_paths = np.asarray(factor_paths, dtype=np.float32)
+        brownian_increments = np.asarray(brownian_increments, dtype=np.float32)
+        rate_paths = np.asarray(rate_paths, dtype=np.float32)
+        hazard_paths = np.asarray(hazard_paths, dtype=np.float32)
+        if collateral is None:
+            collateral = np.zeros(rate_paths.shape, dtype=np.float32)
+        else:
+            collateral = np.asarray(collateral, dtype=np.float32)
+
+        n_paths, n_steps, state_dim, brownian_dim = self._validate_paths(
+            factor_paths,
+            brownian_increments,
+            rate_paths,
+            hazard_paths,
+            collateral,
+        )
+        if n_steps != self.sim.n_steps:
+            raise ValueError("factor_paths time steps must match SimulationConfig")
+        if self.net_cfg.epochs <= 0 or self.net_cfg.batch_size <= 0:
+            raise ValueError("epochs and batch_size must be positive")
+
+        terminal_values = np.asarray(payoff_fn(factor_paths[:, -1, :]), dtype=np.float32)
+        if terminal_values.shape != (n_paths,) or not np.all(np.isfinite(terminal_values)):
+            raise ValueError("payoff_fn must return one finite value per path")
+
+        torch.manual_seed(self.sim.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.sim.seed)
+
+        x_tensor = torch.as_tensor(factor_paths, device=self.device)
+        dw_tensor = torch.as_tensor(brownian_increments, device=self.device)
+        rate_tensor = torch.as_tensor(rate_paths, device=self.device)
+        hazard_tensor = torch.as_tensor(hazard_paths, device=self.device)
+        collateral_tensor = torch.as_tensor(collateral, device=self.device)
+        terminal_tensor = torch.as_tensor(terminal_values, device=self.device)
+
+        feature_mean = x_tensor.mean(dim=(0, 1), keepdim=True)
+        feature_std = x_tensor.std(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+        x_scaled = (x_tensor - feature_mean) / feature_std
+
+        initial_guess = float(np.mean(terminal_values * np.exp(-rate_paths[:, 0] * self.sim.horizon)))
+        y0 = nn.Parameter(torch.tensor(initial_guess, dtype=torch.float32, device=self.device))
+        networks = nn.ModuleList(
+            [
+                SubNetwork(
+                    state_dim,
+                    brownian_dim,
+                    self.net_cfg.hidden_dim,
+                    self.net_cfg.n_layers,
+                )
+                for _ in range(n_steps)
+            ]
+        ).to(self.device)
+        optimizer = optim.Adam(
+            [y0, *networks.parameters()],
+            lr=self.net_cfg.learning_rate,
+        )
         dt = self.sim.horizon / n_steps
-        sqrt_dt = np.sqrt(dt)
+        batch_size = min(self.net_cfg.batch_size, n_paths)
 
-        # Convert paths to torch tensors
-        X_tensor = torch.tensor(X_paths, dtype=torch.float32, device=self.device)
-
-        # Initial value Y_0 (trainable parameter)
-        Y0 = nn.Parameter(torch.tensor([np.mean(payoff_fn(X_paths[:, -1, :]))], dtype=torch.float32, device=self.device))
-        
-        # Sub-networks for Z_t at each step t
-        subnets = nn.ModuleList([SubNetwork(dim, self.net_cfg.hidden_dim) for _ in range(n_steps)]).to(self.device)
-
-        optimizer = optim.Adam([Y0] + list(subnets.parameters()), lr=self.net_cfg.learning_rate)
-
-        # Driver function f(t, X, Y, Z) representing nonlinear XVA drag
-        def driver(y_val, hazard=0.03, lgd=0.6, funding_spread=0.015):
-            cva_drag = hazard * lgd * torch.relu(y_val)
-            fva_drag = funding_spread * torch.relu(y_val)
-            return -(cva_drag + fva_drag)
-
-        # Training loop
-        for epoch in range(self.net_cfg.epochs):
+        networks.train()
+        for _ in range(self.net_cfg.epochs):
+            batch_index = torch.randperm(n_paths, device=self.device)[:batch_size]
+            value = y0.expand(batch_size)
+            for step in range(n_steps):
+                z_value = networks[step](x_scaled[batch_index, step, :])
+                driver_value = self.driver(
+                    value,
+                    rate_tensor[batch_index, step],
+                    hazard_tensor[batch_index, step],
+                    collateral_tensor[batch_index, step],
+                )
+                value = (
+                    value
+                    - driver_value * dt
+                    + torch.sum(z_value * dw_tensor[batch_index, step, :], dim=1)
+                )
+            loss = torch.mean((value - terminal_tensor[batch_index]) ** 2)
             optimizer.zero_grad()
-            
-            # Forward simulation of Y_t
-            Y = Y0.repeat(n_paths)
-            
-            for t in range(n_steps):
-                X_t = X_tensor[:, t, :]
-                X_next = X_tensor[:, t+1, :]
-                dW = (X_next - X_t) / sqrt_dt  # Proxy Brownian increment
-                
-                Z_t = subnets[t](X_t)
-                
-                # BSDE Forward step: Y_{t+1} = Y_t - f(t, X_t, Y_t, Z_t)*dt + Z_t . dW_t
-                f_val = driver(Y)
-                Y = Y - f_val * dt + torch.sum(Z_t * dW, dim=1)
-
-            # Terminal loss matching payoff g(X_T)
-            terminal_payoff = torch.tensor(payoff_fn(X_paths[:, -1, :]), dtype=torch.float32, device=self.device)
-            loss = torch.mean((Y - terminal_payoff)**2)
-
             loss.backward()
+            torch.nn.utils.clip_grad_norm_([y0, *networks.parameters()], max_norm=10.0)
             optimizer.step()
 
+        networks.eval()
+        with torch.no_grad():
+            full_value = y0.expand(n_paths)
+            for step in range(n_steps):
+                z_value = networks[step](x_scaled[:, step, :])
+                driver_value = self.driver(
+                    full_value,
+                    rate_tensor[:, step],
+                    hazard_tensor[:, step],
+                    collateral_tensor[:, step],
+                )
+                full_value = (
+                    full_value
+                    - driver_value * dt
+                    + torch.sum(z_value * dw_tensor[:, step, :], dim=1)
+                )
+            final_loss = torch.mean((full_value - terminal_tensor) ** 2).item()
+
         return {
-            "Y0": Y0.item(),
-            "loss": loss.item(),
-            "device": str(self.device)
+            "Y0": float(y0.detach().cpu().item()),
+            "loss": float(final_loss),
+            "device": str(self.device),
         }
 
-class LeastSquaresBSDESolver:
-    """
-    Fast Vectorized Least-Squares Monte Carlo (LSMC) Solver for BSDE XVA.
-    Computes backward induction valuation over simulation trajectories.
-    """
-    def __init__(self, sim_config: SimulationConfig, credit_config: CreditConfig):
+
+class LeastSquaresMonteCarloPricer:
+    """One-factor clean-price LSMC benchmark for the demonstration portfolio."""
+
+    def __init__(self, sim_config: SimulationConfig) -> None:
         self.sim = sim_config
-        self.credit = credit_config
 
-    def solve(self, asset_paths: np.ndarray, discount_factors: np.ndarray, payoff_fn) -> np.ndarray:
-        """
-        Backward induction for portfolio valuation matrix (n_paths, n_steps + 1).
-        """
-        n_paths, n_steps_p1 = asset_paths.shape
-        n_steps = n_steps_p1 - 1
-        dt = self.sim.horizon / n_steps
+    def solve(
+        self,
+        asset_paths: np.ndarray,
+        discount_factors: np.ndarray,
+        payoff_fn,
+    ) -> np.ndarray:
+        """Return a clean MTM matrix without CVA or FVA deductions."""
+        asset_paths = np.asarray(asset_paths, dtype=float)
+        discount_factors = np.asarray(discount_factors, dtype=float)
+        expected_shape = (self.sim.n_paths, self.sim.n_steps + 1)
+        if asset_paths.shape != expected_shape or discount_factors.shape != expected_shape:
+            raise ValueError(f"asset_paths and discount_factors must have shape {expected_shape}")
+        if not np.allclose(discount_factors[:, 0], 1.0):
+            raise ValueError("discount_factors[:, 0] must equal one")
 
-        portfolio_values = np.zeros((n_paths, n_steps + 1))
-        portfolio_values[:, -1] = payoff_fn(asset_paths[:, -1])
+        n_paths, n_times = asset_paths.shape
+        values = np.zeros((n_paths, n_times))
+        values[:, -1] = payoff_fn(asset_paths[:, -1])
 
-        for t in range(n_steps - 1, -1, -1):
-            S_t = asset_paths[:, t]
-            df_step = discount_factors[:, t+1] / discount_factors[:, t]
-            continuation_val = portfolio_values[:, t+1] * df_step
+        for step in range(n_times - 2, -1, -1):
+            spot = asset_paths[:, step]
+            step_discount = discount_factors[:, step + 1] / discount_factors[:, step]
+            continuation = values[:, step + 1] * step_discount
+            features = np.column_stack([np.ones(n_paths), spot, spot**2])
+            coefficients, _, _, _ = np.linalg.lstsq(features, continuation, rcond=None)
+            values[:, step] = features @ coefficients
 
-            # Quadratic basis polynomial regression
-            poly_features = np.column_stack([np.ones(n_paths), S_t, S_t**2])
-            coeff, _, _, _ = np.linalg.lstsq(poly_features, continuation_val, rcond=None)
-            
-            # Expected continuation value
-            expected_val = poly_features @ coeff
-            
-            # Nonlinear XVA Driver Correction
-            uncollateralized_exposure = np.maximum(0.0, expected_val)
-            cva_penalty = self.credit.hazard_rate_c * self.credit.lgd_c * uncollateralized_exposure * dt
-            fva_penalty = self.credit.funding_spread * uncollateralized_exposure * dt
-            
-            portfolio_values[:, t] = expected_val - (cva_penalty + fva_penalty)
+        return values
 
-        return portfolio_values
+
+LeastSquaresBSDESolver = LeastSquaresMonteCarloPricer
