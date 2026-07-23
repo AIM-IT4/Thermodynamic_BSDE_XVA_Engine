@@ -26,7 +26,7 @@ def main():
     sim_cfg = SimulationConfig(n_paths=10000, n_steps=252, horizon=1.0, seed=42)
     mkt_cfg = MarketConfig()
     credit_cfg = CreditConfig()
-    bsde_cfg = BSDENetworkConfig(epochs=30)
+    bsde_cfg = BSDENetworkConfig(epochs=5)
 
     print("\n[1/6] Simulating Multi-Factor Stochastic Trajectories...")
     start_time = time.time()

@@ -9,6 +9,14 @@ A novel, production-grade Quantitative Finance Engine implementing **Stochastic 
 
 ---
 
+## 🎨 3D Manifolds & Visual Diagnostics
+
+![3D Quant Manifolds & Volatility Surface Repair](xva_3d_surfaces.png)
+
+![2D Exposure Profiles & XVA Breakdown](xva_thermodynamic_diagnostics.png)
+
+---
+
 ## ⚡ Why This Is NOT a Generic / Traditional Quant Project
 
 Most online quantitative finance projects rely on simple Black-Scholes formulas or basic Monte Carlo loops without credit, funding, or margin frictions. This repository builds a **non-traditional, research-grade front-office lab**:
@@ -35,17 +43,6 @@ $$f(t, X_t, Y_t, Z_t) = -r_t Y_t + \lambda_t^C (1-R_C) (Y_t - M_t)^+ - \lambda_t
 ### 2. Stochastic Thermodynamics Entropy Metric
 Following non-equilibrium thermodynamics, financial arbitrage opportunities correspond to negative entropy production:
 $$\sigma_S(t) = \frac{(\mu(t) - r(t))^2}{\sigma^2(t)} \ge 0$$
-
----
-
-## 🎨 3D Manifolds & Surface Visualizations
-
-The engine generates stunning 3D surface diagnostic plots (`xva_3d_surfaces.png`):
-
-1. **3D Dupire Local Volatility Surface $\sigma_{\text{loc}}(K, T)$**: Visualizes the volatility smile and Optimal Transport KL-repair manifold.
-2. **3D Deep BSDE Portfolio Value Surface $Y(S, V)$**: Captures the nonlinear valuation curvature induced by asymmetric borrowing spreads across Spot Price $S$ and Heston Variance $V$.
-3. **3D Potential Future Exposure (PFE) Density**: Time evolution of uncollateralized exposure across all confidence quantiles $\alpha \in [50\%, 99\%]$.
-4. **3D Wrong-Way Risk (WWR) Hazard Surface $\lambda(S, V)$**: Non-linear coupling between market drawdowns and default intensity.
 
 ---
 
