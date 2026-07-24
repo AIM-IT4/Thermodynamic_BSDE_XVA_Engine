@@ -257,7 +257,3 @@ class StaticArbitrageSurfaceRepair:
     ) -> np.ndarray:
         """Compatibility wrapper returning only repaired implied volatilities."""
         return self.repair(strikes, expiries, raw_implied_vol).repaired_implied_vol
-
-
-class ThermodynamicArbitrageEngine(MarketDiagnostics):
-    """Deprecated compatibility name for descriptive diagnostics only."""

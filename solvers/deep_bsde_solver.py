@@ -211,10 +211,21 @@ class DeepBSDESolver:
                     + torch.sum(z_value * dw_tensor[:, step, :], dim=1)
                 )
             final_loss = torch.mean((full_value - terminal_tensor) ** 2).item()
+            terminal_spread = float(terminal_tensor.std(unbiased=False).item())
+
+        rmse = float(np.sqrt(max(final_loss, 0.0)))
+        # Fraction of the terminal payoff dispersion left unhedged by the Z
+        # networks. A value near one means the experiment has not converged and
+        # Y0 is close to its discounted-mean-payoff initialisation rather than a
+        # learned price; a value near zero means the terminal payoff is matched.
+        relative_rmse = rmse / terminal_spread if terminal_spread > 0.0 else float("nan")
 
         return {
             "Y0": float(y0.detach().cpu().item()),
             "loss": float(final_loss),
+            "rmse": rmse,
+            "relative_rmse": relative_rmse,
+            "converged": bool(relative_rmse < 0.10),
             "device": str(self.device),
         }
 
@@ -230,8 +241,16 @@ class LeastSquaresMonteCarloPricer:
         asset_paths: np.ndarray,
         discount_factors: np.ndarray,
         payoff_fn,
+        state_paths: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Return a clean MTM matrix without CVA or FVA deductions."""
+        """Return a clean MTM matrix without CVA or FVA deductions.
+
+        The conditional-expectation regression uses a quadratic spot basis. When
+        ``state_paths`` is supplied (shape ``(n_paths, n_steps + 1, n_state)``,
+        e.g. variance and short rate), those states enter the basis linearly and
+        as a spot cross term, so the fitted MTM depends on the stochastic state
+        rather than on spot alone.
+        """
         asset_paths = np.asarray(asset_paths, dtype=float)
         discount_factors = np.asarray(discount_factors, dtype=float)
         expected_shape = (self.sim.n_paths, self.sim.n_steps + 1)
@@ -241,6 +260,13 @@ class LeastSquaresMonteCarloPricer:
             raise ValueError("discount_factors[:, 0] must equal one")
 
         n_paths, n_times = asset_paths.shape
+        if state_paths is not None:
+            state_paths = np.asarray(state_paths, dtype=float)
+            if state_paths.ndim != 3 or state_paths.shape[:2] != (n_paths, n_times):
+                raise ValueError(
+                    f"state_paths must have shape ({n_paths}, {n_times}, n_state)"
+                )
+
         values = np.zeros((n_paths, n_times))
         values[:, -1] = payoff_fn(asset_paths[:, -1])
 
@@ -248,7 +274,12 @@ class LeastSquaresMonteCarloPricer:
             spot = asset_paths[:, step]
             step_discount = discount_factors[:, step + 1] / discount_factors[:, step]
             continuation = values[:, step + 1] * step_discount
-            features = np.column_stack([np.ones(n_paths), spot, spot**2])
+            columns = [np.ones(n_paths), spot, spot**2]
+            if state_paths is not None:
+                for state_index in range(state_paths.shape[2]):
+                    state = state_paths[:, step, state_index]
+                    columns.extend([state, spot * state])
+            features = np.column_stack(columns)
             coefficients, _, _, _ = np.linalg.lstsq(features, continuation, rcond=None)
             values[:, step] = features @ coefficients
 

@@ -13,7 +13,7 @@ The tracked charts below are produced by run_simulation.py from simulated
 paths and static call-price repair. They are illustrative teaching outputs,
 not calibration, validation, or a no-arbitrage certificate.
 
-![Pathwise XVA diagnostics](xva_thermodynamic_diagnostics.png)
+![Pathwise XVA diagnostics](xva_diagnostics.png)
 
 ![Data-backed XVA surfaces](xva_3d_surfaces.png)
 
@@ -27,8 +27,12 @@ not calibration, validation, or a no-arbitrage certificate.
   intensities remain coupled on each Monte-Carlo path.
 - Variation-margin threshold, minimum-transfer amount, call frequency, and
   margin-period-of-risk close-out exposure.
-- A clean-price LSMC benchmark. It deliberately does not subtract XVA, so
-  adjustments are not charged twice.
+- A clean-price LSMC benchmark whose conditional-expectation regression can be
+  augmented with the simulated variance and short-rate states, so the fitted
+  mark-to-market depends on the stochastic state rather than on spot alone. It
+  deliberately does not subtract XVA, so adjustments are not charged twice.
+- Discounted spot Delta and Gamma from an initial-spot bump propagated through
+  the simulated paths, rather than an additive shift of the terminal spot.
 - Simplified funding-cost adjustment plus explicitly labelled IM and capital
   proxies for MVA and KVA.
 - An optional Deep-BSDE teaching experiment that consumes the actual simulated
@@ -56,8 +60,7 @@ not calibration, validation, or a no-arbitrage certificate.
     models/stochastic_processes.py    Joint factor paths and actual dW increments
     xva/engine.py                     Collateral, MPOR, pathwise XVA, Greeks
     solvers/deep_bsde_solver.py       Clean LSMC and optional Deep-BSDE experiment
-    solvers/thermodynamic_arbitrage.py
-                                      Descriptive diagnostics and static repair
+    solvers/surface_repair.py         Descriptive diagnostics and static repair
     run_simulation.py                 Data-backed 2D and 3D charts
     tests/test_engine.py              Numerical and behavioural tests
 
