@@ -280,7 +280,16 @@ class ComprehensiveXVAEngine:
         discount_factors: np.ndarray,
         h: float = 1.0,
     ) -> dict[str, float]:
-        """Calculate discounted bump-and-revalue Delta and Gamma."""
+        """Calculate discounted bump-and-revalue spot Delta and Gamma.
+
+        The bump is applied to the initial spot and propagated to the terminal
+        spot by the homogeneity of the simulated dynamics: log-Euler paths
+        scale S_T linearly with S_0, so bumping S_0 by h with the Brownian
+        increments held fixed multiplies each terminal spot by (S_0 +/- h)/S_0.
+        This yields dV/dS_0. An additive shift of the terminal spot instead
+        measures sensitivity to a parallel move of the terminal distribution,
+        which materially understates the spot Delta of a convex payoff.
+        """
         if h <= 0.0:
             raise ValueError("h must be positive")
         asset_paths = self._validate_time_matrix(asset_paths, "asset_paths")
@@ -288,11 +297,19 @@ class ComprehensiveXVAEngine:
         if asset_paths.shape != discount_factors.shape:
             raise ValueError("asset_paths and discount_factors must have the same shape")
 
+        initial_spot = asset_paths[:, 0]
+        if np.any(initial_spot <= 0.0):
+            raise ValueError("initial spot must be strictly positive")
+        if h >= float(np.min(initial_spot)):
+            raise ValueError("h must be smaller than the initial spot")
+
         terminal_spot = asset_paths[:, -1]
         terminal_df = discount_factors[:, -1]
+        scale_up = (initial_spot + h) / initial_spot
+        scale_down = (initial_spot - h) / initial_spot
         base_value = float(np.mean(terminal_df * payoff_fn(terminal_spot)))
-        value_up = float(np.mean(terminal_df * payoff_fn(terminal_spot + h)))
-        value_down = float(np.mean(terminal_df * payoff_fn(terminal_spot - h)))
+        value_up = float(np.mean(terminal_df * payoff_fn(terminal_spot * scale_up)))
+        value_down = float(np.mean(terminal_df * payoff_fn(terminal_spot * scale_down)))
 
         return {
             "Value": base_value,

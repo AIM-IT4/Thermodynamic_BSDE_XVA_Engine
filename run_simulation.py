@@ -16,7 +16,7 @@ from matplotlib import cm
 from config import BSDENetworkConfig, CreditConfig, MarketConfig, SimulationConfig
 from models.stochastic_processes import MultiFactorStochasticEngine
 from solvers.deep_bsde_solver import DeepBSDESolver, LeastSquaresMonteCarloPricer
-from solvers.thermodynamic_arbitrage import MarketDiagnostics, StaticArbitrageSurfaceRepair
+from solvers.surface_repair import MarketDiagnostics, StaticArbitrageSurfaceRepair
 from xva.engine import ComprehensiveXVAEngine
 
 
@@ -49,7 +49,13 @@ def main() -> None:
 
     print("\n[2/5] Pricing a clean teaching portfolio and computing collateral...")
     clean_pricer = LeastSquaresMonteCarloPricer(sim_cfg)
-    clean_mtm = clean_pricer.solve(paths["S"], paths["discount_factors"], straddle_payoff)
+    state_paths = np.stack([paths["V"], paths["r"]], axis=-1)
+    clean_mtm = clean_pricer.solve(
+        paths["S"],
+        paths["discount_factors"],
+        straddle_payoff,
+        state_paths=state_paths,
+    )
     xva_engine = ComprehensiveXVAEngine(sim_cfg, credit_cfg)
     exposure_profiles = xva_engine.compute_exposure_profiles(clean_mtm)
     xva_results = xva_engine.calculate_xva_metrics(
@@ -100,8 +106,14 @@ def main() -> None:
         )
         print(
             f"      Experimental Deep-BSDE Y0: USD {deep_result['Y0']:,.2f}; "
-            f"terminal loss: {deep_result['loss']:.4f}."
+            f"terminal RMSE: USD {deep_result['rmse']:,.2f} "
+            f"({deep_result['relative_rmse']:.1%} of payoff dispersion)."
         )
+        if not deep_result["converged"]:
+            print(
+                "      Warning: terminal payoff is largely unhedged, so Y0 is close "
+                "to its discounted-mean-payoff start, not a converged price."
+            )
     else:
         print("\n      Deep-BSDE experiment skipped. Set RUN_DEEP_BSDE=1 to run it.")
 
@@ -158,7 +170,7 @@ def main() -> None:
     axes[1, 1].grid(alpha=0.2)
 
     figure.tight_layout()
-    figure.savefig(output_dir / "xva_thermodynamic_diagnostics.png", dpi=220)
+    figure.savefig(output_dir / "xva_diagnostics.png", dpi=220)
     plt.close(figure)
 
     print("\n[5/5] Creating 3D diagnostics from actual simulated or repaired data...")

@@ -10,7 +10,7 @@ import torch
 from config import BSDENetworkConfig, CreditConfig, MarketConfig, SimulationConfig
 from models.stochastic_processes import MultiFactorStochasticEngine
 from solvers.deep_bsde_solver import DeepBSDESolver, LeastSquaresMonteCarloPricer
-from solvers.thermodynamic_arbitrage import MarketDiagnostics, StaticArbitrageSurfaceRepair
+from solvers.surface_repair import MarketDiagnostics, StaticArbitrageSurfaceRepair
 from xva.engine import ComprehensiveXVAEngine
 
 
@@ -147,6 +147,35 @@ class TestEducationalXVALab(unittest.TestCase):
         self.assertTrue(np.allclose(values[:, -1], payoff(self.paths["S"][:, -1])))
         self.assertTrue(np.all(np.isfinite(values)))
 
+    def test_spot_greeks_are_initial_spot_sensitivities(self) -> None:
+        engine = ComprehensiveXVAEngine(self.sim, self.credit)
+        linear_payoff = lambda spot: 2.5 * spot
+        greeks = engine.compute_greeks(
+            self.paths["S"],
+            linear_payoff,
+            self.paths["discount_factors"],
+            h=1.0,
+        )
+        initial_spot = self.paths["S"][0, 0]
+        # A linear claim has Delta = V / S0 and zero Gamma under an initial-spot
+        # bump; an additive terminal-spot bump would not satisfy this identity.
+        self.assertAlmostEqual(greeks["Delta"], greeks["Value"] / initial_spot, places=6)
+        self.assertAlmostEqual(greeks["Gamma"], 0.0, places=6)
+
+    def test_lsmc_state_augmented_basis_changes_fit(self) -> None:
+        payoff = lambda spot: np.maximum(spot - 100.0, 0.0)
+        pricer = LeastSquaresMonteCarloPricer(self.sim)
+        spot_only = pricer.solve(self.paths["S"], self.paths["discount_factors"], payoff)
+        state = np.stack([self.paths["V"], self.paths["r"]], axis=-1)
+        augmented = pricer.solve(
+            self.paths["S"],
+            self.paths["discount_factors"],
+            payoff,
+            state_paths=state,
+        )
+        self.assertTrue(np.allclose(augmented[:, -1], payoff(self.paths["S"][:, -1])))
+        self.assertFalse(np.allclose(spot_only, augmented))
+
     def test_market_diagnostic_is_finite_and_descriptive(self) -> None:
         diagnostic = MarketDiagnostics.compute_excess_return_dispersion(
             self.paths["S"],
@@ -215,6 +244,9 @@ class TestEducationalXVALab(unittest.TestCase):
         )
         self.assertTrue(np.isfinite(result["Y0"]))
         self.assertTrue(np.isfinite(result["loss"]))
+        self.assertTrue(np.isfinite(result["rmse"]))
+        self.assertGreaterEqual(result["relative_rmse"], 0.0)
+        self.assertIsInstance(result["converged"], bool)
 
 
 if __name__ == "__main__":
